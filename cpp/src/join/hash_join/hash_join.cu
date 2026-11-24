@@ -14,6 +14,9 @@
 #include <cudf/detail/row_operator/primitive_row_operators.cuh>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
 #include <cudf/join/hash_join.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -138,6 +141,13 @@ hash_join<Hasher>::hash_join(cudf::table_view const& right,
                "Invalid load factor: must be greater than 0 and less than or equal to 1.",
                std::invalid_argument);
 
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  // Zero-engine-change Late Materialization hook: when an active `<table>__key` scan exists and the
+  // build table is a `0x5E`-tagged `_espresso_rowid` column, build `<= 128 KiB` GPU survival bitmaps.
+  if (espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_hash_join_build(_right, stream);
+  }
+#endif
   if (_is_empty) { return; }
 
   auto const row_bitmask =

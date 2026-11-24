@@ -34,6 +34,7 @@ namespace parquet::detail {
 
 // Forward declaration of the implementation class
 class reader_impl;
+struct espresso_reader_bridge;
 
 /**
  * @brief Class to read Parquet dataset data into columns.
@@ -41,6 +42,7 @@ class reader_impl;
 class reader {
  protected:
   std::unique_ptr<reader_impl> _impl;
+  std::unique_ptr<espresso_reader_bridge> _espresso_bridge;
 
   /**
    * @brief Default constructor, needed for subclassing.

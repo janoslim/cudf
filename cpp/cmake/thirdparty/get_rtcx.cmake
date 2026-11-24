@@ -24,6 +24,15 @@ function(find_and_configure_rtcx VERSION)
   # When CPM fetches from source (add_subdirectory), embed.cmake is not auto-included. Include it
   # explicitly so add_embed/embed_includes/embed functions are available.
   if(rtcx_ADDED OR DEFINED CPM_rtcx_SOURCE)
+    # GCC 15+ removed transitive <variant> include from <filesystem>; ensure embed.hpp includes it.
+    if(EXISTS "${rtcx_SOURCE_DIR}/embed.hpp")
+      file(READ "${rtcx_SOURCE_DIR}/embed.hpp" _rtcx_embed_hdr)
+      string(FIND "${_rtcx_embed_hdr}" "#include <variant>" _rtcx_has_variant)
+      if(_rtcx_has_variant EQUAL -1)
+        string(REPLACE "#include <vector>" "#include <variant>\n#include <vector>" _rtcx_embed_hdr "${_rtcx_embed_hdr}")
+        file(WRITE "${rtcx_SOURCE_DIR}/embed.hpp" "${_rtcx_embed_hdr}")
+      endif()
+    endif()
     include("${rtcx_SOURCE_DIR}/embed.cmake")
   endif()
 endfunction()

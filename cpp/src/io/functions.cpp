@@ -26,6 +26,10 @@
 #include <cudf/io/orc.hpp>
 #include <cudf/io/orc_metadata.hpp>
 #include <cudf/io/parquet.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/cudf_io.hpp>
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -648,6 +652,18 @@ table_with_metadata read_parquet(parquet_reader_options const& options,
 {
   CUDF_FUNC_RANGE();
 
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (auto virt = espresso::late_mat::LateMatBridgeRegistry::instance().try_read_virtual_table(
+        options, stream, mr);
+      virt.has_value()) {
+    return std::move(*virt);
+  }
+  if (auto csd_res = espresso::cudf_io::try_read_parquet(options, stream, mr);
+      csd_res.has_value()) {
+    return std::move(*csd_res);
+  }
+#endif
+
   auto datasources = make_datasources(options.get_source());
   auto reader      = std::make_unique<detail_parquet::reader>(
     std::move(datasources), std::vector<parquet::FileMetaData>{}, options, stream, mr);
@@ -674,7 +690,12 @@ parquet_metadata read_parquet_metadata(source_info const& src_info)
   CUDF_FUNC_RANGE();
 
   auto datasources = make_datasources(src_info);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  return espresso::late_mat::maybe_append_virtual_rowid_metadata(
+    src_info, detail_parquet::read_parquet_metadata(datasources));
+#else
   return detail_parquet::read_parquet_metadata(datasources);
+#endif
 }
 
 std::vector<parquet::FileMetaData> read_parquet_footers(

@@ -121,6 +121,13 @@ option(
   ON
 )
 
+option(
+  CUDF_USE_ESPRESSO_CSD
+  "Enable Espresso SmartSSD computational storage Parquet scan and late-materialization bridge"
+  OFF
+)
+set(ESPRESSO_ROOT "" CACHE PATH "Path to gpu-smartssd-olap/espresso directory when CUDF_USE_ESPRESSO_CSD=ON")
+
 message(VERBOSE "CUDF: Build with NVTX support: ${USE_NVTX}")
 message(VERBOSE "CUDF: Configure CMake to build tests: ${BUILD_TESTS}")
 message(VERBOSE "CUDF: Configure CMake to build benchmarks: ${BUILD_BENCHMARKS}")
@@ -787,6 +794,7 @@ add_library(
   src/io/parquet/experimental/dictionary_page_filter.cu
   src/io/parquet/experimental/deletion_vectors.cu
   src/io/parquet/experimental/deletion_vectors_helpers.cu
+  src/io/parquet/experimental/csd_late_materialization.cpp
   src/io/parquet/experimental/hybrid_scan.cpp
   src/io/parquet/experimental/hybrid_scan_chunking.cu
   src/io/parquet/experimental/hybrid_scan_helpers.cpp
@@ -1399,6 +1407,20 @@ SECTIONS
 ]=]
 )
 target_link_options(cudf PRIVATE "$<HOST_LINK:${CUDF_BINARY_DIR}/fatbin.ld>")
+
+if(CUDF_USE_ESPRESSO_CSD)
+  if(NOT ESPRESSO_ROOT OR NOT EXISTS "${ESPRESSO_ROOT}/CMakeLists.txt")
+    message(FATAL_ERROR "CUDF_USE_ESPRESSO_CSD=ON requires ESPRESSO_ROOT pointing to gpu-smartssd-olap/espresso")
+  endif()
+  set(ESPRESSO_EMBED_INTO_CUDF ON CACHE BOOL "Embed Espresso objects into libcudf" FORCE)
+  add_subdirectory("${ESPRESSO_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/espresso_embedded")
+  target_sources(cudf PRIVATE $<TARGET_OBJECTS:espresso_cudf_objects>)
+  target_include_directories(cudf PRIVATE "$<BUILD_INTERFACE:${ESPRESSO_ROOT}/include>")
+  target_compile_definitions(cudf PRIVATE CUDF_HAS_ESPRESSO_CSD=1)
+  target_link_libraries(cudf PRIVATE ${ESPRESSO_LINK_LIBRARIES})
+  target_link_options(cudf PUBLIC "$<BUILD_INTERFACE:${ESPRESSO_PUBLIC_LINK_OPTIONS}>")
+  set_property(TARGET cudf APPEND PROPERTY BUILD_RPATH ${ESPRESSO_BUILD_RPATHS})
+endif()
 
 add_library(cudf::cudf ALIAS cudf)
 
