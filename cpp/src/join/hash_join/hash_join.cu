@@ -13,6 +13,9 @@
 #include <cudf/detail/row_operator/hashing.cuh>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
 #include <cudf/join/hash_join.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -98,6 +101,11 @@ hash_join<Hasher>::hash_join(cudf::table_view const& right,
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(0 != right.num_columns(), "Hash join right table is empty", std::invalid_argument);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_hash_join_build(_right, stream);
+  }
+#endif
   if (_is_empty) { return; }
 
   CUDF_CUDA_TRY(cudaMemsetAsync(

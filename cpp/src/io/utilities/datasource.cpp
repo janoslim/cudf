@@ -10,6 +10,9 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/config_utils.hpp>
 #include <cudf/io/datasource.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include "io/utilities/espresso_datasource_registry.hpp"
+#endif
 #include <cudf/logger.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
@@ -148,7 +151,17 @@ class file_source : public kvikio_source<kvikio::FileHandle> {
     CUDF_LOG_INFO(
       "Reading a file using kvikIO, with compatibility mode %s.",
       _kvikio_handle.get_compat_mode_manager().is_compat_mode_preferred() ? "on" : "off");
+#ifdef CUDF_HAS_ESPRESSO_CSD
+    espresso_detail::EspressoDatasourceRegistry::instance().register_path(this, filepath);
+#endif
   }
+
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  ~file_source() override
+  {
+    espresso_detail::EspressoDatasourceRegistry::instance().unregister_path(this);
+  }
+#endif
 
   [[nodiscard]] bool is_device_read_direct(size_t size) const override
   {
@@ -194,7 +207,17 @@ class memory_mapped_source : public kvikio_source<kvikio::MmapHandle> {
       _kvikio_handle =
         kvikio::MmapHandle(filepath, "r", std::nullopt, 0, kvikio::FileHandle::m644, MAP_SHARED);
     }
+#ifdef CUDF_HAS_ESPRESSO_CSD
+    espresso_detail::EspressoDatasourceRegistry::instance().register_path(this, filepath);
+#endif
   }
+
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  ~memory_mapped_source() override
+  {
+    espresso_detail::EspressoDatasourceRegistry::instance().unregister_path(this);
+  }
+#endif
 };
 
 /**
@@ -294,7 +317,22 @@ class host_buffer_source final : public datasource {
  */
 class user_datasource_wrapper : public datasource {
  public:
-  explicit user_datasource_wrapper(datasource* const source) : source(source) {}
+  explicit user_datasource_wrapper(datasource* const source) : source(source)
+  {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+    if (auto p = espresso_detail::EspressoDatasourceRegistry::instance().lookup_path(source);
+        p.has_value()) {
+      espresso_detail::EspressoDatasourceRegistry::instance().register_path(this, *p);
+    }
+#endif
+  }
+
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  ~user_datasource_wrapper() override
+  {
+    espresso_detail::EspressoDatasourceRegistry::instance().unregister_path(this);
+  }
+#endif
 
   size_t host_read(size_t offset, size_t size, uint8_t* dst) override
   {

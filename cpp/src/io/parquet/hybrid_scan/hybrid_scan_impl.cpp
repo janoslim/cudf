@@ -4,6 +4,11 @@
  */
 
 #include "hybrid_scan_impl.hpp"
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include "io/utilities/espresso_datasource_registry.hpp"
+#include <espresso/cudf_io.hpp>
+#include <espresso/late_mat_bridge.hpp>
+#endif
 
 #include "cudf/io/text/byte_range_info.hpp"
 #include "hybrid_scan_helpers.hpp"
@@ -157,6 +162,185 @@ namespace {
 
 }  // namespace
 
+#ifdef CUDF_HAS_ESPRESSO_CSD
+struct espresso_hybrid_state {
+  std::vector<std::string> filepaths;
+  bool is_virtual_table{false};
+  std::size_t all_cols_bypass_passes{0};
+  bool pass_active{false};
+  std::optional<table_with_metadata> single_pass_table;
+  std::unique_ptr<espresso::cudf_io::csd_chunked_scan_state> csd_chunked;
+  std::unique_ptr<espresso::late_mat::VirtualChunkedScanState> virt_chunked;
+
+  void reset_pass()
+  {
+    pass_active = false;
+    single_pass_table.reset();
+    csd_chunked.reset();
+    virt_chunked.reset();
+  }
+
+  [[nodiscard]] bool has_next() const noexcept
+  {
+    if (!pass_active) { return false; }
+    if (single_pass_table.has_value()) { return true; }
+    if (virt_chunked != nullptr) { return virt_chunked->has_next(); }
+    if (csd_chunked != nullptr) { return csd_chunked->has_next(); }
+    return false;
+  }
+
+  [[nodiscard]] table_with_metadata next_chunk()
+  {
+    if (single_pass_table.has_value()) {
+      auto out = std::move(*single_pass_table);
+      single_pass_table.reset();
+      pass_active = false;
+      return out;
+    }
+    if (virt_chunked != nullptr) {
+      auto out = virt_chunked->read_chunk();
+      if (!virt_chunked->has_next()) { pass_active = false; }
+      return out;
+    }
+    auto out = csd_chunked->read_chunk();
+    if (!csd_chunked->has_next()) { pass_active = false; }
+    return out;
+  }
+};
+
+hybrid_scan_reader_impl::~hybrid_scan_reader_impl() = default;
+
+void hybrid_scan_reader_impl::init_espresso_hybrid_state()
+{
+  if (_extended_metadata == nullptr) { return; }
+  auto const metadatas = _extended_metadata->parquet_metadatas();
+  if (metadatas.empty()) { return; }
+
+  std::vector<std::string> extracted;
+  extracted.reserve(metadatas.size());
+  for (auto const& fmd : metadatas) {
+    std::string found;
+    for (auto const& kv : fmd.key_value_metadata) {
+      if (kv.key == cudf::io::espresso_detail::ESPRESSO_FILEPATH_META_KEY && kv.value.has_value() &&
+          !kv.value->empty()) {
+        found = *kv.value;
+        break;
+      }
+    }
+    if (found.empty()) { return; }
+    extracted.push_back(std::move(found));
+  }
+
+  _espresso                   = std::make_unique<espresso_hybrid_state>();
+  _espresso->filepaths        = std::move(extracted);
+  _espresso->is_virtual_table =
+    espresso::late_mat::parse_virtual_table_path(_espresso->filepaths.front()).role !=
+    espresso::late_mat::VirtualTableRole::None;
+}
+
+bool hybrid_scan_reader_impl::can_espresso_offload_all_columns(
+  std::span<std::vector<size_type> const> row_group_indices,
+  parquet_reader_options const& options) const
+{
+  if (_espresso == nullptr || _espresso->filepaths.empty() ||
+      _espresso->filepaths.size() != _extended_metadata->get_num_sources() ||
+      row_group_indices.size() != _espresso->filepaths.size()) {
+    return false;
+  }
+  if (_espresso->is_virtual_table) { return true; }
+  if (!espresso::cudf_io::is_csd_dropin_enabled()) { return false; }
+
+  // Fail-closed strict mode (`$ESPRESSO_CSD_STRICT=1`): always route through the zero-byte hook so
+  // `setup_chunking_for_all_columns` invokes `espresso::cudf_io::read_parquet` (`strict_csd=true`)
+  // and raises an immediate explicit error instead of silently falling back to host/GDS reads.
+  if (espresso::cudf_io::is_csd_strict_mode()) { return true; }
+
+  for (auto const& fp : _espresso->filepaths) {
+    if (!espresso::cudf_io::is_smartssd_parquet_path(fp)) { return false; }
+  }
+  if (options.get_skip_rows() != 0 || options.get_num_rows().has_value() ||
+      options.is_enabled_convert_strings_to_categories() ||
+      options.is_enabled_prepend_source_index_column() ||
+      options.is_enabled_prepend_row_index_column() ||
+      options.get_decimal_width() == type_id::DECIMAL128) {
+    return false;
+  }
+
+  // Verify in-memory column types, codecs, and projected null-free invariants (`_input_columns` is
+  // already populated by `select_columns(ALL_COLUMNS, options)`).
+  std::size_t const projected_cols =
+    _input_columns.size() >= _num_filter_only_columns ? (_input_columns.size() - _num_filter_only_columns) : 0;
+  for (std::size_t col_i = 0; col_i < _input_columns.size(); ++col_i) {
+    auto const& ic = _input_columns[col_i];
+    if (ic.nesting.size() != 1) { return false; }
+    auto const& sch = _extended_metadata->get_schema(ic.schema_idx);
+    if (sch.type != Type::INT32 && sch.type != Type::INT64 && sch.type != Type::BYTE_ARRAY) {
+      return false;
+    }
+    bool const is_decimal =
+      sch.converted_type == ConvertedType::DECIMAL ||
+      (sch.logical_type.has_value() && sch.logical_type->type == LogicalType::DECIMAL);
+    if (is_decimal && sch.type == Type::BYTE_ARRAY) { return false; }
+
+    bool const needs_null_free =
+      (col_i < projected_cols) && (sch.repetition_type == FieldRepetitionType::OPTIONAL);
+    for (std::size_t src_i = 0; src_i < row_group_indices.size(); ++src_i) {
+      for (size_type const rg_idx : row_group_indices[src_i]) {
+        auto const& cm = _extended_metadata->get_column_metadata(rg_idx, src_i, ic.schema_idx);
+        if (cm.codec != Compression::UNCOMPRESSED && cm.codec != Compression::SNAPPY) {
+          return false;
+        }
+        if (needs_null_free) {
+          if (!cm.statistics.null_count.has_value() || *cm.statistics.null_count > 0) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
+parquet_reader_options hybrid_scan_reader_impl::build_espresso_pass_options(
+  std::span<std::vector<size_type> const> row_group_indices,
+  parquet_reader_options const& options) const
+{
+  // Honor the `options` and `row_group_indices` supplied at `setup_chunking_for_all_columns` /
+  // `materialize_all_columns` (including split-specific decimal AST filters set by Velox).
+  // Split byte-range bounds have already been resolved into `row_group_indices` by
+  // `filter_row_groups_with_byte_range`, so `skip_bytes` / `num_bytes` are intentionally omitted.
+  auto builder = parquet_reader_options::builder(source_info{_espresso->filepaths})
+                   .row_groups(std::vector<std::vector<size_type>>{row_group_indices.begin(),
+                                                                   row_group_indices.end()})
+                   .use_pandas_metadata(options.is_enabled_use_pandas_metadata())
+                   .use_arrow_schema(options.is_enabled_use_arrow_schema())
+                   .allow_mismatched_pq_schemas(false)
+                   .case_sensitive_names(options.is_enabled_case_sensitive_names())
+                   .ignore_missing_columns(options.is_enabled_ignore_missing_columns())
+                   .convert_strings_to_categories(options.is_enabled_convert_strings_to_categories())
+                   .timestamp_type(options.get_timestamp_type())
+                   .decimal_width(options.get_decimal_width());
+  if (options.get_skip_rows() != 0) { builder.skip_rows(options.get_skip_rows()); }
+  if (options.get_num_rows().has_value()) { builder.num_rows(*options.get_num_rows()); }
+  if (options.is_enabled_prepend_source_index_column()) {
+    builder.prepend_source_index_column(true);
+  }
+  if (options.is_enabled_prepend_row_index_column()) {
+    builder.prepend_row_index_column(true);
+  }
+  if (auto const& names = options.get_column_names(); names.has_value()) {
+    builder.column_names(*names);
+  } else if (auto const& indices = options.get_column_indices(); indices.has_value()) {
+    builder.column_indices(*indices);
+  } else if (auto const& fids = options.get_column_field_ids(); fids.has_value()) {
+    builder.column_field_ids(*fids);
+  }
+  auto pass_opts = builder.build();
+  if (options.get_filter().has_value()) { pass_opts.set_filter(options.get_filter()->get()); }
+  return pass_opts;
+}
+#endif
+
 void hybrid_scan_reader_impl::mark_buffers_nullable_for_pruned_pages()
 {
   auto const& pass               = *_pass_itm_data;
@@ -204,6 +388,9 @@ hybrid_scan_reader_impl::hybrid_scan_reader_impl(
                                                 options.is_enabled_allow_mismatched_pq_schemas());
 
   _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  init_espresso_hybrid_state();
+#endif
 }
 
 hybrid_scan_reader_impl::hybrid_scan_reader_impl(std::span<FileMetaData const> parquet_metadatas,
@@ -214,6 +401,9 @@ hybrid_scan_reader_impl::hybrid_scan_reader_impl(std::span<FileMetaData const> p
                                                 options.is_enabled_use_arrow_schema(),
                                                 options.is_enabled_allow_mismatched_pq_schemas());
   _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  init_espresso_hybrid_state();
+#endif
 }
 
 hybrid_scan_reader_impl::hybrid_scan_reader_impl(std::vector<FileMetaData>&& parquet_metadatas,
@@ -224,6 +414,9 @@ hybrid_scan_reader_impl::hybrid_scan_reader_impl(std::vector<FileMetaData>&& par
                                                 options.is_enabled_use_arrow_schema(),
                                                 options.is_enabled_allow_mismatched_pq_schemas());
   _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  init_espresso_hybrid_state();
+#endif
 }
 
 hybrid_scan_reader_impl::hybrid_scan_reader_impl(
@@ -232,6 +425,9 @@ hybrid_scan_reader_impl::hybrid_scan_reader_impl(
   CUDF_EXPECTS(metadata != nullptr, "Shared parquet metadata must not be null");
   _metadata          = std::move(metadata);
   _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  init_espresso_hybrid_state();
+#endif
 }
 
 std::vector<FileMetaData> hybrid_scan_reader_impl::parquet_metadatas() const
@@ -241,6 +437,15 @@ std::vector<FileMetaData> hybrid_scan_reader_impl::parquet_metadatas() const
 
 std::vector<byte_range_info> hybrid_scan_reader_impl::page_index_byte_ranges() const
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (_espresso != nullptr && !_espresso->filepaths.empty() &&
+      (_espresso->is_virtual_table ||
+       (espresso::cudf_io::is_csd_dropin_enabled() &&
+        (espresso::cudf_io::is_csd_strict_mode() ||
+         std::ranges::all_of(_espresso->filepaths, espresso::cudf_io::is_smartssd_parquet_path))))) {
+    return std::vector<byte_range_info>(_extended_metadata->get_num_sources(), byte_range_info{0, 0});
+  }
+#endif
   return _extended_metadata->page_index_byte_ranges();
 }
 
@@ -579,6 +784,17 @@ hybrid_scan_reader_impl::column_chunks_byte_ranges(
   CUDF_EXPECTS(not row_group_indices.empty(), "Empty input row group indices encountered");
 
   select_columns(mode, options);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if constexpr (mode == read_columns_mode::ALL_COLUMNS) {
+    if (can_espresso_offload_all_columns(row_group_indices, options)) {
+      ++_espresso->all_cols_bypass_passes;
+      std::vector<byte_range_info> zero_ranges(row_group_indices.size(), byte_range_info{0, 0});
+      std::vector<cudf::size_type> src_map(row_group_indices.size());
+      std::iota(src_map.begin(), src_map.end(), cudf::size_type{0});
+      return {std::move(zero_ranges), std::move(src_map)};
+    }
+  }
+#endif
   return get_input_column_chunk_byte_ranges(row_group_indices);
 }
 
@@ -774,6 +990,28 @@ table_with_metadata hybrid_scan_reader_impl::materialize_table(
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if constexpr (mode == read_columns_mode::ALL_COLUMNS) {
+    select_columns(mode, options);
+    if ((_espresso != nullptr && _espresso->all_cols_bypass_passes > 0) ||
+        can_espresso_offload_all_columns(row_group_indices, options)) {
+      auto const pass_opts = build_espresso_pass_options(row_group_indices, options);
+      try {
+        if (_espresso->is_virtual_table) {
+          auto virt = espresso::late_mat::LateMatBridgeRegistry::instance().try_read_virtual_table(
+            pass_opts, stream, mr.get_output_mr());
+          if (virt.has_value()) { return std::move(*virt); }
+        }
+        return espresso::cudf_io::read_parquet(
+          pass_opts, {.emit_rowids = false, .strict_csd = true}, stream, mr.get_output_mr());
+      } catch (std::exception const& ex) {
+        throw std::runtime_error(std::string(ex.what()) +
+                                 " [via hybrid_scan_multifile: all_column_chunks_byte_ranges=0B, bypassed_passes=" +
+                                 std::to_string(_espresso ? _espresso->all_cols_bypass_passes : 0) + "]");
+      }
+    }
+  }
+#endif
   auto constexpr sparse_page_io = false;
   prepare_materialization(read_mode::READ_ALL,
                           mode,
@@ -803,6 +1041,40 @@ void hybrid_scan_reader_impl::setup_chunked_table_materialization(
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (_espresso != nullptr) { _espresso->reset_pass(); }
+  if constexpr (mode == read_columns_mode::ALL_COLUMNS) {
+    select_columns(mode, options);
+    if ((_espresso != nullptr && _espresso->all_cols_bypass_passes > 0) ||
+        can_espresso_offload_all_columns(row_group_indices, options)) {
+      auto const pass_opts = build_espresso_pass_options(row_group_indices, options);
+      try {
+        if (_espresso->is_virtual_table) {
+          _espresso->virt_chunked = espresso::late_mat::VirtualChunkedScanState::try_create(
+            chunk_read_limit, pass_read_limit, pass_opts, stream, mr.get_output_mr());
+          CUDF_EXPECTS(_espresso->virt_chunked != nullptr, "Failed to open virtual table chunked scan");
+        } else if (chunk_read_limit == 0) {
+          _espresso->single_pass_table = espresso::cudf_io::read_parquet(
+            pass_opts, {.emit_rowids = false, .strict_csd = true}, stream, mr.get_output_mr());
+        } else {
+          _espresso->csd_chunked = espresso::cudf_io::csd_chunked_scan_state::create_with_rowids(
+            chunk_read_limit,
+            pass_read_limit,
+            pass_opts,
+            {.emit_rowids = false, .strict_csd = true},
+            stream,
+            mr.get_output_mr());
+        }
+        _espresso->pass_active = true;
+        return;
+      } catch (std::exception const& ex) {
+        throw std::runtime_error(std::string(ex.what()) +
+                                 " [via hybrid_scan_multifile: all_column_chunks_byte_ranges=0B, bypassed_passes=" +
+                                 std::to_string(_espresso ? _espresso->all_cols_bypass_passes : 0) + "]");
+      }
+    }
+  }
+#endif
   auto constexpr sparse_page_io = false;
   prepare_materialization(read_mode::CHUNKED_READ,
                           mode,
@@ -847,6 +1119,13 @@ template <read_columns_mode mode>
 table_with_metadata hybrid_scan_reader_impl::materialize_table_chunk(
   row_mask_view_t<mode> const& row_mask)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if constexpr (mode == read_columns_mode::ALL_COLUMNS) {
+    if (_espresso != nullptr && _espresso->pass_active) {
+      return _espresso->next_chunk();
+    }
+  }
+#endif
   CUDF_EXPECTS(_file_preprocessed and _selected_columns_mode.has_value(),
                "Chunking for columns not yet setup");
   CUDF_EXPECTS(_selected_columns_mode == mode,
@@ -941,6 +1220,12 @@ hybrid_scan_reader_impl::construct_row_group_passes(
 
 bool hybrid_scan_reader_impl::has_next_table_chunk()
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (_espresso != nullptr && (_espresso->pass_active || _espresso->all_cols_bypass_passes > 0)) {
+    if (_espresso->pass_active) { return _espresso->has_next(); }
+    if (!_file_preprocessed) { return false; }
+  }
+#endif
   CUDF_EXPECTS(_file_preprocessed, "Chunking not yet setup");
   prepare_data(read_mode::CHUNKED_READ, {}, {}, {});
 

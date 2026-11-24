@@ -34,8 +34,19 @@ namespace cudf::io::parquet::detail {
 /**
  * @brief Implementation for Parquet reader
  */
+#ifdef CUDF_HAS_ESPRESSO_CSD
+struct espresso_reader_bridge;
+#endif
+
 class reader_impl {
  public:
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  explicit reader_impl(std::shared_ptr<espresso_reader_bridge> bridge);
+  [[nodiscard]] bool has_espresso_bridge() const noexcept { return _espresso_bridge != nullptr; }
+  [[nodiscard]] bool espresso_has_next() const;
+  [[nodiscard]] table_with_metadata espresso_read_chunk();
+  [[nodiscard]] table_with_metadata espresso_read_all();
+#endif
   /**
    * @brief Default constructor for subclassing
    */
@@ -637,6 +648,9 @@ class reader_impl {
   // be selected. Read here rather than in a constructor body because
   // `hybrid_scan_reader_impl` reaches this class through the default constructor.
   bool _nz_map_enabled{cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_NZ_MAP", false)};
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  std::shared_ptr<espresso_reader_bridge> _espresso_bridge;
+#endif
 };
 
 }  // namespace cudf::io::parquet::detail

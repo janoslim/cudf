@@ -54,8 +54,15 @@ using row_mask_view_t = std::conditional_t<mode == read_columns_mode::FILTER_COL
 /**
  * @brief Implementation of the experimental Parquet reader optimized for Hybrid Scan operation
  */
+#ifdef CUDF_HAS_ESPRESSO_CSD
+struct espresso_hybrid_state;
+#endif
+
 class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
  public:
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  ~hybrid_scan_reader_impl();
+#endif
   /**
    * @brief Constructor for the experimental parquet reader implementation
    *
@@ -633,6 +640,16 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
 
   // Currently selected columns, if any
   std::optional<read_columns_mode> _selected_columns_mode;
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  void init_espresso_hybrid_state();
+  [[nodiscard]] bool can_espresso_offload_all_columns(
+    std::span<std::vector<size_type> const> row_group_indices,
+    parquet_reader_options const& options) const;
+  [[nodiscard]] parquet_reader_options build_espresso_pass_options(
+    std::span<std::vector<size_type> const> row_group_indices,
+    parquet_reader_options const& options) const;
+  std::unique_ptr<espresso_hybrid_state> _espresso;
+#endif
 };
 
 }  // namespace cudf::io::parquet::hybrid_scan::detail
