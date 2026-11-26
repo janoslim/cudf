@@ -6,6 +6,7 @@
 #include "reader_impl.hpp"
 
 #ifdef CUDF_HAS_ESPRESSO_CSD
+#include "io/utilities/espresso_datasource_registry.hpp"
 #include <cudf/concatenate.hpp>
 #include <espresso/cudf_io.hpp>
 #include <espresso/late_mat_bridge.hpp>
@@ -15,7 +16,7 @@ namespace cudf::io::parquet::detail {
 
 #ifdef CUDF_HAS_ESPRESSO_CSD
 struct espresso_reader_bridge {
-  std::unique_ptr<espresso::late_mat::VirtualChunkedScanState> virtual_state;
+  std::unique_ptr<espresso::late_mat::SelfJoinChunkedScanState> sj_state;
   std::unique_ptr<espresso::cudf_io::csd_chunked_scan_state> csd_state;
   cuda::stream_ref stream;
   rmm::device_async_resource_ref mr;
@@ -25,21 +26,26 @@ struct espresso_reader_bridge {
   {
   }
 
-  static std::shared_ptr<espresso_reader_bridge> try_open(std::size_t chunk_read_limit,
-                                                          std::size_t pass_read_limit,
-                                                          parquet_reader_options const& options,
-                                                          cuda::stream_ref stream,
-                                                          rmm::device_async_resource_ref mr)
+  static std::shared_ptr<espresso_reader_bridge> try_open(
+    std::size_t chunk_read_limit,
+    std::size_t pass_read_limit,
+    std::span<FileMetaData const> parquet_metadatas,
+    parquet_reader_options const& options,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr)
   {
-    if (auto virt = espresso::late_mat::VirtualChunkedScanState::try_create(
-          chunk_read_limit, pass_read_limit, options, stream, mr);
-        virt != nullptr) {
-      auto b           = std::make_shared<espresso_reader_bridge>(stream, mr);
-      b->virtual_state = std::move(virt);
+    auto const meta_opts =
+      cudf::io::espresso_detail::try_options_with_metadata_filepaths(options, parquet_metadatas);
+    parquet_reader_options const& eff_opts = meta_opts.has_value() ? *meta_opts : options;
+    if (auto sj = espresso::late_mat::SelfJoinChunkedScanState::try_create(
+          chunk_read_limit, pass_read_limit, eff_opts, stream, mr);
+        sj != nullptr) {
+      auto b      = std::make_shared<espresso_reader_bridge>(stream, mr);
+      b->sj_state = std::move(sj);
       return b;
     }
     if (auto csd = espresso::cudf_io::csd_chunked_scan_state::try_create(
-          chunk_read_limit, pass_read_limit, options, stream, mr);
+          chunk_read_limit, pass_read_limit, eff_opts, stream, mr);
         csd != nullptr) {
       auto b       = std::make_shared<espresso_reader_bridge>(stream, mr);
       b->csd_state = std::move(csd);
@@ -50,12 +56,12 @@ struct espresso_reader_bridge {
 
   [[nodiscard]] bool has_next() const
   {
-    return virtual_state ? virtual_state->has_next() : (csd_state && csd_state->has_next());
+    return sj_state ? sj_state->has_next() : (csd_state && csd_state->has_next());
   }
 
   [[nodiscard]] table_with_metadata read_chunk()
   {
-    return virtual_state ? virtual_state->read_chunk() : csd_state->read_chunk();
+    return sj_state ? sj_state->read_chunk() : csd_state->read_chunk();
   }
 
   [[nodiscard]] table_with_metadata read_all()
@@ -96,7 +102,8 @@ reader::reader(std::vector<std::unique_ptr<datasource>>&& sources,
                cudf::memory_resources mr)
 {
 #ifdef CUDF_HAS_ESPRESSO_CSD
-  if (auto b = espresso_reader_bridge::try_open(0, 0, options, stream, mr.get_output_mr());
+  if (auto b =
+        espresso_reader_bridge::try_open(0, 0, parquet_metadatas, options, stream, mr.get_output_mr());
       b != nullptr) {
     _impl = std::make_unique<reader_impl>(std::move(b));
     return;
@@ -126,7 +133,7 @@ chunked_reader::chunked_reader(std::size_t chunk_read_limit,
 {
 #ifdef CUDF_HAS_ESPRESSO_CSD
   if (auto b = espresso_reader_bridge::try_open(
-        chunk_read_limit, pass_read_limit, options, stream, mr.get_output_mr());
+        chunk_read_limit, pass_read_limit, parquet_metadatas, options, stream, mr.get_output_mr());
       b != nullptr) {
     _impl = std::make_unique<reader_impl>(std::move(b));
     return;

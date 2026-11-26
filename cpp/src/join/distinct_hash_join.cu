@@ -15,6 +15,9 @@
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/join/join.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -173,6 +176,11 @@ distinct_hash_join::distinct_hash_join(cudf::table_view const& right,
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(0 != this->_right.num_columns(), "Hash join right table is empty");
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_hash_join_build(_right, stream);
+  }
+#endif
   size_type const right_table_num_rows{_right.num_rows()};
 
   if (right_table_num_rows == 0) { return; }

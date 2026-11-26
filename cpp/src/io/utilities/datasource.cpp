@@ -12,6 +12,9 @@
 #include <cudf/io/datasource.hpp>
 #ifdef CUDF_HAS_ESPRESSO_CSD
 #include "io/utilities/espresso_datasource_registry.hpp"
+#include <espresso/csd_gpu_runtime.hpp>
+#include <espresso/cudf_io.hpp>
+#include <espresso/late_mat_bridge.hpp>
 #endif
 #include <cudf/logger.hpp>
 #include <cudf/utilities/error.hpp>
@@ -143,6 +146,82 @@ class kvikio_source : public datasource {
  * This class is derived from `kvikio_source` and is used to handle file operations
  * using kvikIO library.
  */
+#ifdef CUDF_HAS_ESPRESSO_CSD
+/**
+ * @brief Lightweight zero-KvikIO datasource for SmartSSD Parquet files when Espresso GPU runtime is open.
+ *
+ * Avoids `kvikio::FileHandle` (`CUFileInit` + `cuFileHandleRegister`) completely during Velox split creation
+ * (`2-3 s/query` eliminated across 64 driver threads). File size comes directly from Espresso's startup FIEMAP
+ * cache (`GpuRuntime::cached_file_bytes`). `host_read` lazily opens plain POSIX `fd` only if a non-offloaded
+ * fallback ever requests raw bytes (`0` POSIX opens on Espresso-offloaded scans).
+ */
+class espresso_smartssd_source final : public datasource {
+ public:
+  espresso_smartssd_source(std::string filepath, std::size_t file_size)
+    : _filepath(std::move(filepath)), _size(file_size)
+  {
+    espresso_detail::EspressoDatasourceRegistry::instance().register_path(this, _filepath);
+  }
+
+  ~espresso_smartssd_source() override
+  {
+    espresso_detail::EspressoDatasourceRegistry::instance().unregister_path(this);
+    if (_fd >= 0) {
+      ::close(_fd);
+      _fd = -1;
+    }
+  }
+
+  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
+  {
+    if (offset >= _size) { return buffer::create(std::vector<uint8_t>{}); }
+    auto const read_size = std::min(size, _size - offset);
+    std::vector<uint8_t> buf(read_size);
+    auto const got = host_read(offset, read_size, buf.data());
+    buf.resize(got);
+    return buffer::create(std::move(buf));
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    if (offset >= _size || size == 0) { return 0; }
+    auto const read_size = std::min(size, _size - offset);
+    int const fd         = ensure_fd();
+    std::size_t total    = 0;
+    while (total < read_size) {
+      ssize_t const n = ::pread(fd, dst + total, read_size - total, static_cast<off_t>(offset + total));
+      if (n < 0) {
+        if (errno == EINTR) { continue; }
+        CUDF_FAIL("espresso_smartssd_source pread failed for " + _filepath);
+      }
+      if (n == 0) { break; }
+      total += static_cast<std::size_t>(n);
+    }
+    return total;
+  }
+
+  [[nodiscard]] bool supports_device_read() const override { return false; }
+
+  [[nodiscard]] size_t size() const override { return _size; }
+
+ private:
+  int ensure_fd()
+  {
+    std::lock_guard const lock(_fd_mtx);
+    if (_fd < 0) {
+      _fd = ::open(_filepath.c_str(), O_RDONLY);
+      CUDF_EXPECTS(_fd >= 0, "espresso_smartssd_source failed to open file: " + _filepath);
+    }
+    return _fd;
+  }
+
+  std::string _filepath;
+  std::size_t _size{0};
+  std::mutex _fd_mtx;
+  int _fd{-1};
+};
+#endif
+
 class file_source : public kvikio_source<kvikio::FileHandle> {
  public:
   explicit file_source(char const* filepath) : kvikio_source{kvikio::FileHandle(filepath, "r")}
@@ -514,6 +593,22 @@ std::unique_ptr<datasource> datasource::create(std::string const& filepath,
         return std::make_unique<remote_file_source>(remote_file_path.c_str(), known_size);
       }
     }
+
+#ifdef CUDF_HAS_ESPRESSO_CSD
+    if ((espresso::cudf_io::is_csd_dropin_enabled() ||
+         espresso::late_mat::is_sql_rewrite_bridge_enabled()) &&
+        espresso::csd::GpuRuntime::is_open()) {
+      std::string const norm_path = espresso_detail::normalize_local_filepath(filepath);
+      std::string const real_path = espresso_detail::resolve_canonical_local_path(norm_path);
+      if (espresso::cudf_io::is_smartssd_parquet_path(real_path)) {
+        std::size_t const file_sz =
+          known_size.has_value()
+            ? *known_size
+            : static_cast<std::size_t>(espresso::csd::GpuRuntime::get().cached_file_bytes(real_path));
+        return std::make_unique<espresso_smartssd_source>(norm_path, file_sz);
+      }
+    }
+#endif
 
     // `file_source` reads the file directly, without memory mapping
     return std::make_unique<file_source>(filepath.c_str());
