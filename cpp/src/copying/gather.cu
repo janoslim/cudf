@@ -5,6 +5,9 @@
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/detail/gather.cuh>
 #include <cudf/detail/gather.hpp>
 #include <cudf/detail/indexalator.cuh>
@@ -82,7 +85,16 @@ std::unique_ptr<table> gather(table_view const& source_table,
   auto const index_policy = is_unsigned(gather_map.type()) ? negative_index_policy::NOT_ALLOWED
                                                            : negative_index_policy::ALLOWED;
 
-  return detail::gather(source_table, gather_map, bounds_policy, index_policy, stream, mr);
+  auto out = detail::gather(source_table, gather_map, bounds_policy, index_policy, stream, mr);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (out != nullptr && out->num_rows() > 0 &&
+      !espresso::late_mat::is_bridge_hook_suppressed() &&
+      espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
+      espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_gather_table(out->view(), stream);
+  }
+#endif
+  return out;
 }
 
 std::unique_ptr<table> gather(table_view const& source_table,
@@ -93,7 +105,16 @@ std::unique_ptr<table> gather(table_view const& source_table,
                               rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::gather(source_table, gather_map, bounds_policy, neg_indices, stream, mr);
+  auto out = detail::gather(source_table, gather_map, bounds_policy, neg_indices, stream, mr);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (out != nullptr && out->num_rows() > 0 &&
+      !espresso::late_mat::is_bridge_hook_suppressed() &&
+      espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
+      espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_gather_table(out->view(), stream);
+  }
+#endif
+  return out;
 }
 
 }  // namespace cudf

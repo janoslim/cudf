@@ -530,6 +530,7 @@ std::unique_ptr<scalar> reduce(column_view const& col,
   // finished core build key with MIN/MAX before launching the Pass-2 payload scan and before
   // constructing cudf::hash_join.
   if (agg.kind == aggregation::MIN && result != nullptr &&
+      !espresso::late_mat::is_bridge_hook_suppressed() &&
       espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
       espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
     espresso::late_mat::LateMatBridgeRegistry::instance().on_reduce_min_key(col, *result, stream);

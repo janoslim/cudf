@@ -6,6 +6,9 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/concatenate.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/detail/concatenate_masks.hpp>
 #include <cudf/detail/copy.hpp>
 #include <cudf/detail/device_scalar.hpp>
@@ -624,7 +627,16 @@ std::unique_ptr<table> concatenate(std::span<table_view const> tables_to_concat,
                                    rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::concatenate(tables_to_concat, stream, mr);
+  auto out = detail::concatenate(tables_to_concat, stream, mr);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (out != nullptr && out->num_rows() > 0 &&
+      !espresso::late_mat::is_bridge_hook_suppressed() &&
+      espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
+      espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_concatenate_table(out->view(), stream);
+  }
+#endif
+  return out;
 }
 
 }  // namespace cudf

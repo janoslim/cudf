@@ -16,6 +16,9 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
 #include <cudf/partitioning.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -955,6 +958,13 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition(
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (!espresso::late_mat::is_bridge_hook_suppressed() &&
+      espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
+      espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_partition_table(input, num_partitions, stream);
+  }
+#endif
   return detail::hash_partition(
     input, input.select(columns_to_hash), num_partitions, hash_function, seed, stream, mr);
 }
@@ -969,6 +979,13 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition(
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (!espresso::late_mat::is_bridge_hook_suppressed() &&
+      espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
+      espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_partition_table(input, num_partitions, stream);
+  }
+#endif
   return detail::hash_partition(input, keys, num_partitions, hash_function, seed, stream, mr);
 }
 
