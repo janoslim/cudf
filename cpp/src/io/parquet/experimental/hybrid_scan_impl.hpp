@@ -38,8 +38,15 @@ using text::byte_range_info;
 /**
  * @brief Implementation of the experimental Parquet reader optimized for Hybrid Scan operation
  */
+#ifdef CUDF_HAS_ESPRESSO_CSD
+struct espresso_hybrid_state;
+#endif
+
 class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
  public:
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  ~hybrid_scan_reader_impl();
+#endif
   /**
    * @brief Constructor for the experimental parquet reader implementation
    *
@@ -567,6 +574,16 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
   bool _is_filter_columns_selected{false};
   bool _is_payload_columns_selected{false};
   bool _is_all_columns_selected{false};
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  void init_espresso_hybrid_state();
+  [[nodiscard]] bool can_espresso_offload_all_columns(
+    std::span<std::vector<size_type> const> row_group_indices,
+    parquet_reader_options const& options) const;
+  [[nodiscard]] parquet_reader_options build_espresso_pass_options(
+    std::span<std::vector<size_type> const> row_group_indices,
+    parquet_reader_options const& options) const;
+  std::unique_ptr<espresso_hybrid_state> _espresso;
+#endif
 };
 
 }  // namespace cudf::io::parquet::experimental::detail

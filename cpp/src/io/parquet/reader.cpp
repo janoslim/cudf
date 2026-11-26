@@ -6,6 +6,7 @@
 #include "reader_impl.hpp"
 
 #ifdef CUDF_HAS_ESPRESSO_CSD
+#include "io/utilities/espresso_datasource_registry.hpp"
 #include <cudf/concatenate.hpp>
 #include <espresso/cudf_io.hpp>
 #include <espresso/late_mat_bridge.hpp>
@@ -15,7 +16,7 @@ namespace cudf::io::parquet::detail {
 
 struct espresso_reader_bridge {
 #ifdef CUDF_HAS_ESPRESSO_CSD
-  std::unique_ptr<espresso::late_mat::VirtualChunkedScanState> virtual_state;
+  std::unique_ptr<espresso::late_mat::SelfJoinChunkedScanState> sj_state;
   std::unique_ptr<espresso::cudf_io::csd_chunked_scan_state> csd_state;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
@@ -25,21 +26,26 @@ struct espresso_reader_bridge {
   {
   }
 
-  static std::unique_ptr<espresso_reader_bridge> try_open(std::size_t chunk_read_limit,
-                                                          std::size_t pass_read_limit,
-                                                          parquet_reader_options const& options,
-                                                          rmm::cuda_stream_view stream,
-                                                          rmm::device_async_resource_ref mr)
+  static std::unique_ptr<espresso_reader_bridge> try_open(
+    std::size_t chunk_read_limit,
+    std::size_t pass_read_limit,
+    std::span<FileMetaData const> parquet_metadatas,
+    parquet_reader_options const& options,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr)
   {
-    if (auto virt = espresso::late_mat::VirtualChunkedScanState::try_create(
-          chunk_read_limit, pass_read_limit, options, stream, mr);
-        virt != nullptr) {
-      auto b           = std::make_unique<espresso_reader_bridge>(stream, mr);
-      b->virtual_state = std::move(virt);
+    auto const meta_opts =
+      cudf::io::espresso_detail::try_options_with_metadata_filepaths(options, parquet_metadatas);
+    parquet_reader_options const& eff_opts = meta_opts.has_value() ? *meta_opts : options;
+    if (auto sj = espresso::late_mat::SelfJoinChunkedScanState::try_create(
+          chunk_read_limit, pass_read_limit, eff_opts, stream, mr);
+        sj != nullptr) {
+      auto b      = std::make_unique<espresso_reader_bridge>(stream, mr);
+      b->sj_state = std::move(sj);
       return b;
     }
     if (auto csd = espresso::cudf_io::csd_chunked_scan_state::try_create(
-          chunk_read_limit, pass_read_limit, options, stream, mr);
+          chunk_read_limit, pass_read_limit, eff_opts, stream, mr);
         csd != nullptr) {
       auto b       = std::make_unique<espresso_reader_bridge>(stream, mr);
       b->csd_state = std::move(csd);
@@ -50,12 +56,12 @@ struct espresso_reader_bridge {
 
   [[nodiscard]] bool has_next() const
   {
-    return virtual_state ? virtual_state->has_next() : (csd_state && csd_state->has_next());
+    return sj_state ? sj_state->has_next() : (csd_state && csd_state->has_next());
   }
 
   [[nodiscard]] table_with_metadata read_chunk()
   {
-    return virtual_state ? virtual_state->read_chunk() : csd_state->read_chunk();
+    return sj_state ? sj_state->read_chunk() : csd_state->read_chunk();
   }
 
   [[nodiscard]] table_with_metadata read_all()
@@ -86,7 +92,7 @@ reader::reader(std::vector<std::unique_ptr<datasource>>&& sources,
                rmm::device_async_resource_ref mr)
 {
 #ifdef CUDF_HAS_ESPRESSO_CSD
-  _espresso_bridge = espresso_reader_bridge::try_open(0, 0, options, stream, mr);
+  _espresso_bridge = espresso_reader_bridge::try_open(0, 0, parquet_metadatas, options, stream, mr);
   if (_espresso_bridge != nullptr) { return; }
 #endif
   _impl = std::make_unique<reader_impl>(
@@ -112,8 +118,8 @@ chunked_reader::chunked_reader(std::size_t chunk_read_limit,
                                rmm::device_async_resource_ref mr)
 {
 #ifdef CUDF_HAS_ESPRESSO_CSD
-  _espresso_bridge =
-    espresso_reader_bridge::try_open(chunk_read_limit, pass_read_limit, options, stream, mr);
+  _espresso_bridge = espresso_reader_bridge::try_open(
+    chunk_read_limit, pass_read_limit, parquet_metadatas, options, stream, mr);
   if (_espresso_bridge != nullptr) { return; }
 #endif
   _impl = std::make_unique<reader_impl>(chunk_read_limit,

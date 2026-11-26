@@ -27,6 +27,7 @@
 #include <cudf/io/orc_metadata.hpp>
 #include <cudf/io/parquet.hpp>
 #ifdef CUDF_HAS_ESPRESSO_CSD
+#include "io/utilities/espresso_datasource_registry.hpp"
 #include <espresso/cudf_io.hpp>
 #include <espresso/late_mat_bridge.hpp>
 #endif
@@ -653,10 +654,10 @@ table_with_metadata read_parquet(parquet_reader_options const& options,
   CUDF_FUNC_RANGE();
 
 #ifdef CUDF_HAS_ESPRESSO_CSD
-  if (auto virt = espresso::late_mat::LateMatBridgeRegistry::instance().try_read_virtual_table(
+  if (auto sj = espresso::late_mat::LateMatBridgeRegistry::instance().try_read_table(
         options, stream, mr);
-      virt.has_value()) {
-    return std::move(*virt);
+      sj.has_value()) {
+    return std::move(*sj);
   }
   if (auto csd_res = espresso::cudf_io::try_read_parquet(options, stream, mr);
       csd_res.has_value()) {
@@ -690,19 +691,76 @@ parquet_metadata read_parquet_metadata(source_info const& src_info)
   CUDF_FUNC_RANGE();
 
   auto datasources = make_datasources(src_info);
-#ifdef CUDF_HAS_ESPRESSO_CSD
-  return espresso::late_mat::maybe_append_virtual_rowid_metadata(
-    src_info, detail_parquet::read_parquet_metadata(datasources));
-#else
   return detail_parquet::read_parquet_metadata(datasources);
-#endif
 }
+
+namespace {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+void attach_espresso_filepath(parquet::FileMetaData& fmd, std::string const& filepath)
+{
+  for (auto const& kv : fmd.key_value_metadata) {
+    if (kv.key == espresso_detail::ESPRESSO_FILEPATH_META_KEY) { return; }
+  }
+  fmd.key_value_metadata.push_back(
+    parquet::KeyValue{espresso_detail::ESPRESSO_FILEPATH_META_KEY, filepath});
+}
+#endif
+}  // namespace
 
 std::vector<parquet::FileMetaData> read_parquet_footers(
   std::span<std::unique_ptr<cudf::io::datasource> const> sources)
 {
   CUDF_FUNC_RANGE();
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (sources.empty()) { return {}; }
+
+  bool const espresso_active =
+    espresso::cudf_io::is_csd_dropin_enabled() || espresso::late_mat::is_sql_rewrite_bridge_enabled();
+
+  std::vector<std::optional<std::string>> paths(sources.size());
+  bool all_have_paths = true;
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    paths[i] = espresso_detail::EspressoDatasourceRegistry::instance().lookup_path(sources[i].get());
+    if (!paths[i].has_value() && espresso_active) {
+      paths[i] = espresso_detail::EspressoDatasetFooterIndex::instance().lookup_datasource_tail(sources[i].get());
+    }
+    if (!paths[i].has_value()) { all_have_paths = false; }
+  }
+
+  if (espresso_active && all_have_paths) {
+    std::vector<parquet::FileMetaData> out(sources.size());
+    std::vector<std::unique_ptr<cudf::io::datasource>> miss_sources;
+    std::vector<std::size_t> miss_indices;
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+      if (auto hit = espresso_detail::EspressoFooterCache::instance().lookup(*paths[i], sources[i]->size());
+          hit.has_value()) {
+        out[i] = std::move(*hit);
+      } else {
+        miss_sources.push_back(cudf::io::datasource::create(sources[i].get()));
+        miss_indices.push_back(i);
+      }
+    }
+    if (!miss_sources.empty()) {
+      auto parsed = detail_parquet::read_parquet_footers(miss_sources);
+      for (std::size_t k = 0; k < miss_indices.size(); ++k) {
+        std::size_t const orig_i = miss_indices[k];
+        attach_espresso_filepath(parsed[k], *paths[orig_i]);
+        espresso_detail::EspressoFooterCache::instance().store(
+          *paths[orig_i], sources[orig_i]->size(), parsed[k]);
+        out[orig_i] = std::move(parsed[k]);
+      }
+    }
+    return out;
+  }
+
+  auto footers = detail_parquet::read_parquet_footers(sources);
+  for (std::size_t i = 0; i < footers.size() && i < paths.size(); ++i) {
+    if (paths[i].has_value()) { attach_espresso_filepath(footers[i], *paths[i]); }
+  }
+  return footers;
+#else
   return detail_parquet::read_parquet_footers(sources);
+#endif
 }
 
 /**
