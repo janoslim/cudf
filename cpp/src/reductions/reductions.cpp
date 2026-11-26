@@ -18,6 +18,9 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/type_checks.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/late_mat_bridge.hpp>
+#endif
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -521,7 +524,18 @@ std::unique_ptr<scalar> reduce(column_view const& col,
                                rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return reduction::detail::reduce(col, agg, output_dtype, std::nullopt, stream, mr);
+  auto result = reduction::detail::reduce(col, agg, output_dtype, std::nullopt, stream, mr);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  // Early SQL-LM survival publication hook: engines with dynamic filter pushdown reduce each
+  // finished core build key with MIN/MAX before launching the Pass-2 payload scan and before
+  // constructing cudf::hash_join.
+  if (agg.kind == aggregation::MIN && result != nullptr &&
+      espresso::late_mat::is_sql_rewrite_bridge_enabled() &&
+      espresso::late_mat::LateMatBridgeRegistry::instance().has_active_key_scans()) {
+    espresso::late_mat::LateMatBridgeRegistry::instance().on_reduce_min_key(col, *result, stream);
+  }
+#endif
+  return result;
 }
 
 std::unique_ptr<scalar> reduce(column_view const& col,
