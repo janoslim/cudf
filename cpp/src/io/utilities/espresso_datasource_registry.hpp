@@ -7,9 +7,8 @@
  *   - Input : Live `cudf::io::datasource const*` pointers, local POSIX file paths, raw Parquet footer byte spans,
  *             `parquet::FileMetaData`, and `espresso::csd::GpuHostParsedFooter`.
  *   - Output: Canonical `.parquet` file paths resolved via `_espresso_filepath` (`EspressoDatasourceRegistry` or
- *             `EspressoDatasetFooterIndex`), plus GPU-parsed `FileMetaData` and `GpuHostParsedFooter` cache entries
- *             keyed by `(filepath, size)`, `filepath`, and `(footer_len, fnv1a_64)` (`0` host `open`/`pread`/Thrift
- *             re-parse on SmartSSD paths).
+ *             `EspressoDatasetFooterIndex`), plus shared read-mostly GPU-parsed `FileMetaData` and
+ *             `GpuHostParsedFooter` cache entries keyed by `(filepath, size)`, `filepath`, and `(footer_len, fnv1a_64)`.
  */
 
 #pragma once
@@ -29,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -45,6 +45,7 @@
 namespace cudf::io::espresso_detail {
 
 inline constexpr char const* ESPRESSO_FILEPATH_META_KEY = "_espresso_filepath";
+inline constexpr char const* ARROW_SCHEMA_META_KEY      = "ARROW:schema";
 inline constexpr std::size_t MAX_CACHED_FOOTERS         = 32768;
 inline constexpr std::size_t GPU_FOOTER_BATCH_CHUNK_MAX = 256;
 
@@ -73,7 +74,6 @@ inline constexpr std::size_t GPU_FOOTER_BATCH_CHUNK_MAX = 256;
     std::shared_mutex mtx;
     std::unordered_map<std::string, std::string> map;
   };
-  // Leaky singleton avoids static-destruction-order hazards across shared libraries at process exit.
   static auto* cache = new CanonicalPathCache();
 
   {
@@ -117,6 +117,18 @@ template <typename OptionalString>
     if (kv.key == ESPRESSO_FILEPATH_META_KEY) {
       std::string_view const val = kv_value_view(kv.value);
       if (!val.empty()) { return normalize_local_filepath(val); }
+    }
+  }
+  return {};
+}
+
+/// Extract `"ARROW:schema"` from `FileMetaData::key_value_metadata` when present.
+[[nodiscard]] inline std::string extract_arrow_schema_metadata(parquet::FileMetaData const& fmd)
+{
+  for (auto const& kv : fmd.key_value_metadata) {
+    if (kv.key == ARROW_SCHEMA_META_KEY) {
+      std::string_view const val = kv_value_view(kv.value);
+      if (!val.empty()) { return std::string(val); }
     }
   }
   return {};
@@ -170,11 +182,12 @@ inline void ensure_espresso_metadata_filepath(parquet::FileMetaData& fmd, std::s
 }
 
 /// Convert a GPU-parsed `GpuHostParsedFooter` into an initialized cuDF `parquet::FileMetaData`
-/// (`schema` tree walked, `schema_idx` populated, `_espresso_filepath` attached).
+/// (`schema` tree walked, `schema_idx` populated, `_espresso_filepath` and optional `ARROW:schema` attached).
 /// Symmetric inverse of `espresso::cudf_io::try_convert_file_metadata` for flat scalar Parquet files.
 [[nodiscard]] inline std::optional<parquet::FileMetaData> convert_gpu_footer_to_file_metadata(
   espresso::csd::GpuHostParsedFooter const& gf,
-  std::string const& filepath)
+  std::string const& filepath,
+  std::string_view arrow_schema_kv = {})
 {
   if (gf.status != espresso::csd::GPU_FOOTER_OK || gf.num_leaf_cols == 0 ||
       gf.leaves.size() != gf.num_leaf_cols ||
@@ -292,7 +305,6 @@ inline void ensure_espresso_metadata_filepath(parquet::FileMetaData& fmd, std::s
         if (!data_encs.empty()) {
           std::vector<parquet::PageEncodingStats> estats;
           estats.reserve(data_encs.size());
-          // Preserve both `pages_total` sum and every active encoding bit across `try_convert_file_metadata`.
           std::uint32_t remaining = cm.pages_total;
           for (std::size_t ei = 0; ei < data_encs.size(); ++ei) {
             std::uint32_t const extra = static_cast<std::uint32_t>(data_encs.size() - 1u - ei);
@@ -328,7 +340,10 @@ inline void ensure_espresso_metadata_filepath(parquet::FileMetaData& fmd, std::s
     r.total_compressed_size = rg_comp_total;
   }
 
-  // Step 3: Attach `_espresso_filepath` so `hybrid_scan_reader` recovers the source path without KvikIO handles.
+  // Step 3: Attach `_espresso_filepath` and (when present for this table) the shared `"ARROW:schema"` KV entry.
+  if (!arrow_schema_kv.empty()) {
+    fmd.key_value_metadata.push_back(parquet::KeyValue{ARROW_SCHEMA_META_KEY, std::string(arrow_schema_kv)});
+  }
   fmd.key_value_metadata.push_back(parquet::KeyValue{ESPRESSO_FILEPATH_META_KEY, filepath});
   return fmd;
 }
@@ -346,28 +361,28 @@ class EspressoDatasourceRegistry {
   {
     if (src == nullptr || raw_path.empty()) { return; }
     std::string norm = normalize_local_filepath(raw_path);
-    std::lock_guard const lock(_mtx);
+    std::unique_lock const lock(_mtx);
     _paths[src] = std::move(norm);
   }
 
   void unregister_path(cudf::io::datasource const* src) noexcept
   {
     if (src == nullptr) { return; }
-    std::lock_guard const lock(_mtx);
+    std::unique_lock const lock(_mtx);
     _paths.erase(src);
   }
 
   [[nodiscard]] std::optional<std::string> lookup_path(cudf::io::datasource const* src) const
   {
     if (src == nullptr) { return std::nullopt; }
-    std::lock_guard const lock(_mtx);
+    std::shared_lock const lock(_mtx);
     auto const it = _paths.find(src);
     if (it == _paths.end()) { return std::nullopt; }
     return it->second;
   }
 
  private:
-  mutable std::mutex _mtx;
+  mutable std::shared_mutex _mtx;
   std::unordered_map<cudf::io::datasource const*, std::string> _paths;
 };
 
@@ -405,17 +420,16 @@ class EspressoDatasetFooterIndex {
   }
 };
 
-/// Cached triple returned by `EspressoFooterCache` so `hybrid_scan_reader(footer_bytes, opts)` skips both CPU Thrift
-/// deserialization and `try_convert_file_metadata` conversion in `O(1)`.
+/// Immutable cached triple returned by `EspressoFooterCache` via `shared_ptr` (`0` deep copies under lock).
 struct EspressoCachedFooterBundle {
   std::string filepath;
   parquet::FileMetaData file_metadata;
   std::optional<espresso::csd::GpuHostParsedFooter> gpu_footer;
 };
 
-/// Thread-safe cache of `parquet::FileMetaData` (keyed by `(filepath, byte_size)`, `filepath`, and
-/// `(footer_len, fnv1a_64)`) and GPU-parsed `GpuHostParsedFooter` (keyed by path), with directory-level GPU NVMe
-/// batch warming (`plan_files_on_gpu`).
+/// Read-mostly thread-safe cache (`std::shared_mutex` + `shared_ptr`) of `parquet::FileMetaData` and GPU-parsed
+/// `GpuHostParsedFooter`, with directory-level GPU NVMe batch warming (`plan_files_on_gpu`) and 1-file `ARROW:schema`
+/// KV reuse across all files in a table directory.
 class EspressoFooterCache {
  public:
   static EspressoFooterCache& instance()
@@ -429,59 +443,47 @@ class EspressoFooterCache {
   {
     std::string const norm = normalize_local_filepath(filepath);
     std::string const key  = make_key(norm, file_size);
-    std::lock_guard const lock(_mtx);
-    if (auto const it = _entries.find(key); it != _entries.end()) { return it->second; }
-    return std::nullopt;
+    std::shared_ptr<EspressoCachedFooterBundle const> bundle;
+    {
+      std::shared_lock const lock(_mtx);
+      if (auto const it = _entries.find(key); it != _entries.end()) { bundle = it->second; }
+    }
+    if (!bundle) { return std::nullopt; }
+    return bundle->file_metadata;
   }
 
   [[nodiscard]] std::optional<espresso::csd::GpuHostParsedFooter> lookup_gpu_footer(
     std::string const& filepath) const
   {
-    std::string const norm = normalize_local_filepath(filepath);
-    {
-      std::lock_guard const lock(_mtx);
-      if (auto const it = _gpu_footers.find(norm); it != _gpu_footers.end()) { return it->second; }
-    }
-    std::string const real = resolve_canonical_local_path(norm);
-    if (real == norm) { return std::nullopt; }
-    std::lock_guard const lock(_mtx);
-    if (auto const it = _gpu_footers.find(real); it != _gpu_footers.end()) { return it->second; }
-    return std::nullopt;
+    auto const bundle = lookup_bundle_by_path(filepath);
+    if (!bundle || !bundle->gpu_footer.has_value()) { return std::nullopt; }
+    return *bundle->gpu_footer;
   }
 
-  [[nodiscard]] std::optional<EspressoCachedFooterBundle> lookup_bundle_by_path(
+  [[nodiscard]] std::shared_ptr<EspressoCachedFooterBundle const> lookup_bundle_by_path(
     std::string const& filepath) const
   {
     std::string const norm = normalize_local_filepath(filepath);
-    auto find_locked       = [this](std::string const& path_key) -> std::optional<EspressoCachedFooterBundle> {
-      auto const fit = _fmd_by_path.find(path_key);
-      if (fit == _fmd_by_path.end()) { return std::nullopt; }
-      EspressoCachedFooterBundle bundle{path_key, fit->second, std::nullopt};
-      if (auto const git = _gpu_footers.find(path_key); git != _gpu_footers.end()) {
-        bundle.gpu_footer = git->second;
-      }
-      return bundle;
-    };
     {
-      std::lock_guard const lock(_mtx);
-      if (auto hit = find_locked(norm); hit.has_value()) { return hit; }
+      std::shared_lock const lock(_mtx);
+      if (auto const it = _by_path.find(norm); it != _by_path.end()) { return it->second; }
     }
     std::string const real = resolve_canonical_local_path(norm);
-    if (real == norm) { return std::nullopt; }
-    std::lock_guard const lock(_mtx);
-    return find_locked(real);
+    if (real == norm) { return nullptr; }
+    std::shared_lock const lock(_mtx);
+    if (auto const it = _by_path.find(real); it != _by_path.end()) { return it->second; }
+    return nullptr;
   }
 
-  [[nodiscard]] std::optional<EspressoCachedFooterBundle> lookup_by_footer_hash(
+  [[nodiscard]] std::shared_ptr<EspressoCachedFooterBundle const> lookup_by_footer_hash(
     std::uint8_t const* data,
     std::size_t len) const
   {
-    if (data == nullptr || len == 0 || len > std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
+    if (data == nullptr || len == 0 || len > std::numeric_limits<std::uint32_t>::max()) { return nullptr; }
     FooterHashKey const key{static_cast<std::uint32_t>(len), hash_parquet_footer_bytes(data, len)};
-    std::lock_guard const lock(_mtx);
+    std::shared_lock const lock(_mtx);
     auto const it = _by_footer_hash.find(key);
-    if (it != _by_footer_hash.end()) { return it->second; }
-    return std::nullopt;
+    return (it != _by_footer_hash.end()) ? it->second : nullptr;
   }
 
   void store(std::string const& filepath,
@@ -490,11 +492,16 @@ class EspressoFooterCache {
   {
     std::string const norm = normalize_local_filepath(filepath);
     std::string const key  = make_key(norm, file_size);
-    std::lock_guard const lock(_mtx);
+    auto bundle            = std::make_shared<EspressoCachedFooterBundle>();
+    bundle->filepath       = norm;
+    bundle->file_metadata  = meta;
+    ensure_espresso_metadata_filepath(bundle->file_metadata, norm);
+
+    std::unique_lock const lock(_mtx);
     if (_entries.size() >= MAX_CACHED_FOOTERS) { _entries.clear(); }
-    _entries[key] = meta;
-    if (_fmd_by_path.size() >= MAX_CACHED_FOOTERS) { _fmd_by_path.clear(); }
-    _fmd_by_path[norm] = meta;
+    if (_by_path.size() >= MAX_CACHED_FOOTERS) { _by_path.clear(); }
+    _entries[key]  = bundle;
+    _by_path[norm] = std::move(bundle);
   }
 
   void store_by_footer_hash(std::uint8_t const* data,
@@ -504,26 +511,26 @@ class EspressoFooterCache {
                             std::optional<espresso::csd::GpuHostParsedFooter> const& gpu_footer)
   {
     if (data == nullptr || len == 0 || len > std::numeric_limits<std::uint32_t>::max()) { return; }
-    std::string const norm           = normalize_local_filepath(filepath);
-    parquet::FileMetaData stored_fmd = meta;
-    ensure_espresso_metadata_filepath(stored_fmd, norm);
+    std::string const norm = normalize_local_filepath(filepath);
     FooterHashKey const key{static_cast<std::uint32_t>(len), hash_parquet_footer_bytes(data, len)};
+    auto bundle           = std::make_shared<EspressoCachedFooterBundle>();
+    bundle->filepath      = norm;
+    bundle->file_metadata = meta;
+    ensure_espresso_metadata_filepath(bundle->file_metadata, norm);
+    bundle->gpu_footer = gpu_footer;
 
-    std::lock_guard const lock(_mtx);
+    std::unique_lock const lock(_mtx);
     if (_by_footer_hash.size() >= MAX_CACHED_FOOTERS) { _by_footer_hash.clear(); }
-    _by_footer_hash[key] = EspressoCachedFooterBundle{norm, stored_fmd, gpu_footer};
-    if (_fmd_by_path.size() >= MAX_CACHED_FOOTERS) { _fmd_by_path.clear(); }
-    _fmd_by_path[norm] = std::move(stored_fmd);
-    if (gpu_footer.has_value()) {
-      if (_gpu_footers.size() >= MAX_CACHED_FOOTERS) { _gpu_footers.clear(); }
-      _gpu_footers[norm] = *gpu_footer;
-    }
+    if (_by_path.size() >= MAX_CACHED_FOOTERS) { _by_path.clear(); }
+    _by_footer_hash[key] = bundle;
+    _by_path[norm]       = std::move(bundle);
   }
 
   /// Batch-parse every SmartSSD `.parquet` footer in `sample_filepath`'s parent directory on the GPU
   /// via `GpuRuntime::plan_files_on_gpu` (`<= 256` files/chunk, `0` host `open`/`pread`/Thrift parse).
-  /// Mutex-deduplicated so concurrent driver threads warm a table directory exactly once.
-  bool warm_directory_on_gpu(std::string const& sample_filepath)
+  /// When `arrow_schema_kv` is non-empty (extracted once from file 0 on PyArrow-written tables), attaches it
+  /// to every converted `FileMetaData` so the other N-1 files skip CPU Thrift parsing completely.
+  bool warm_directory_on_gpu(std::string const& sample_filepath, std::string_view arrow_schema_kv = {})
   {
     if (!espresso::csd::GpuRuntime::is_open()) { return false; }
 
@@ -569,14 +576,13 @@ class EspressoFooterCache {
         throw std::runtime_error("[espresso::footer_cache] plan_files_on_gpu count mismatch for dir " + dir_key);
       }
 
-      // Step 3: Convert each `GpuHostParsedFooter` -> `FileMetaData` and index by path, `(path, size)`, and hash.
+      // Step 3: Build immutable `shared_ptr<EspressoCachedFooterBundle>` outside `_mtx` so readers never stall.
       struct WarmedRow {
         std::string lpath;
         std::string rpath;
         std::size_t fsize;
-        parquet::FileMetaData fmd;
-        espresso::csd::GpuHostParsedFooter gf;
         std::optional<std::pair<std::uint32_t, std::uint64_t>> fp;
+        std::shared_ptr<EspressoCachedFooterBundle const> bundle;
       };
       std::vector<WarmedRow> batch_rows;
       batch_rows.reserve(parsed.size());
@@ -589,7 +595,7 @@ class EspressoFooterCache {
                                    std::to_string(gf.status) + ") for SmartSSD file: " + rpath);
         }
         std::size_t const fsize = static_cast<std::size_t>(gpu_rt.cached_file_bytes(rpath));
-        auto fmd                = convert_gpu_footer_to_file_metadata(gf, lpath);
+        auto fmd                = convert_gpu_footer_to_file_metadata(gf, lpath, arrow_schema_kv);
         if (!fmd.has_value()) {
           throw std::runtime_error("[espresso::footer_cache] Failed to convert GpuHostParsedFooter to FileMetaData: " +
                                    rpath);
@@ -598,25 +604,27 @@ class EspressoFooterCache {
         if (!fp.has_value() && rpath != lpath) {
           fp = espresso::csd::lookup_cached_file_fingerprint(rpath);
         }
-        batch_rows.push_back(WarmedRow{lpath, rpath, fsize, std::move(*fmd), std::move(parsed[k]), fp});
+        auto bundle           = std::make_shared<EspressoCachedFooterBundle>();
+        bundle->filepath      = lpath;
+        bundle->file_metadata = std::move(*fmd);
+        bundle->gpu_footer    = std::move(parsed[k]);
+        batch_rows.push_back(WarmedRow{lpath, rpath, fsize, fp, std::move(bundle)});
       }
 
-      std::lock_guard const lock(_mtx);
+      std::unique_lock const lock(_mtx);
       if (_entries.size() + batch_rows.size() * 2u >= MAX_CACHED_FOOTERS) { _entries.clear(); }
-      if (_gpu_footers.size() + batch_rows.size() * 2u >= MAX_CACHED_FOOTERS) { _gpu_footers.clear(); }
-      if (_fmd_by_path.size() + batch_rows.size() * 2u >= MAX_CACHED_FOOTERS) { _fmd_by_path.clear(); }
+      if (_by_path.size() + batch_rows.size() * 2u >= MAX_CACHED_FOOTERS) { _by_path.clear(); }
       if (_by_footer_hash.size() + batch_rows.size() >= MAX_CACHED_FOOTERS) { _by_footer_hash.clear(); }
       for (auto& row : batch_rows) {
         if (row.fp.has_value()) {
-          _by_footer_hash[FooterHashKey{row.fp->first, row.fp->second}] =
-            EspressoCachedFooterBundle{row.lpath, row.fmd, row.gf};
+          _by_footer_hash[FooterHashKey{row.fp->first, row.fp->second}] = row.bundle;
         }
-        _gpu_footers[row.lpath] = row.gf;
-        if (row.rpath != row.lpath) { _gpu_footers[row.rpath] = std::move(row.gf); }
-        _fmd_by_path[row.lpath] = row.fmd;
-        if (row.rpath != row.lpath) { _fmd_by_path[row.rpath] = row.fmd; }
-        _entries[make_key(row.lpath, row.fsize)] = row.fmd;
-        if (row.rpath != row.lpath) { _entries[make_key(row.rpath, row.fsize)] = std::move(row.fmd); }
+        _by_path[row.lpath]                      = row.bundle;
+        _entries[make_key(row.lpath, row.fsize)] = row.bundle;
+        if (row.rpath != row.lpath) {
+          _by_path[row.rpath]                      = row.bundle;
+          _entries[make_key(row.rpath, row.fsize)] = row.bundle;
+        }
       }
     }
 
@@ -642,13 +650,13 @@ class EspressoFooterCache {
     return filepath + "|" + std::to_string(file_size);
   }
 
-  mutable std::mutex _mtx;
+  mutable std::shared_mutex _mtx;
   std::mutex _warm_mtx;
   std::unordered_set<std::string> _warmed_dirs;
-  std::unordered_map<std::string, parquet::FileMetaData> _entries;
-  std::unordered_map<std::string, parquet::FileMetaData> _fmd_by_path;
-  std::unordered_map<std::string, espresso::csd::GpuHostParsedFooter> _gpu_footers;
-  std::unordered_map<FooterHashKey, EspressoCachedFooterBundle, FooterHashKeyHasher> _by_footer_hash;
+  std::unordered_map<std::string, std::shared_ptr<EspressoCachedFooterBundle const>> _entries;
+  std::unordered_map<std::string, std::shared_ptr<EspressoCachedFooterBundle const>> _by_path;
+  std::unordered_map<FooterHashKey, std::shared_ptr<EspressoCachedFooterBundle const>, FooterHashKeyHasher>
+    _by_footer_hash;
 };
 
 }  // namespace cudf::io::espresso_detail

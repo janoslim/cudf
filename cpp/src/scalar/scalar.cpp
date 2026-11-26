@@ -16,8 +16,70 @@
 #include <rmm/device_buffer.hpp>
 
 #include <string>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/cudf_io.hpp>
+#include <espresso/late_mat_bridge.hpp>
+#include <limits>
+#include <type_traits>
+#endif
 
 namespace cudf {
+
+#ifdef CUDF_HAS_ESPRESSO_CSD
+namespace {
+[[nodiscard]] inline bool espresso_scalar_mirror_active() noexcept
+{
+  return espresso::cudf_io::is_csd_dropin_enabled() || espresso::late_mat::is_sql_rewrite_bridge_enabled();
+}
+
+template <typename T>
+inline void mirror_fixed_width_host_scalar(void const* validity_ptr,
+                                           void const* data_ptr,
+                                           data_type dtype,
+                                           T value,
+                                           bool is_valid) noexcept
+{
+  if (!espresso_scalar_mirror_active()) { return; }
+  espresso::cudf_io::csd_host_literal_value lit{dtype, is_valid, 0, 0, 0.0};
+  if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> || std::is_same_v<T, int32_t> ||
+                std::is_same_v<T, int64_t>) {
+    lit.signed_v = static_cast<std::int64_t>(value);
+  } else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t> || std::is_same_v<T, uint32_t> ||
+                       std::is_same_v<T, uint64_t>) {
+    lit.uint_v = static_cast<std::uint64_t>(value);
+  } else if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+    lit.float_v = static_cast<double>(value);
+  } else if constexpr (std::is_same_v<T, timestamp_D> || std::is_same_v<T, timestamp_s> ||
+                       std::is_same_v<T, timestamp_ms> || std::is_same_v<T, timestamp_us> ||
+                       std::is_same_v<T, timestamp_ns>) {
+    lit.signed_v = static_cast<std::int64_t>(value.time_since_epoch().count());
+  } else {
+    espresso::cudf_io::erase_host_scalar_mirror(validity_ptr);
+    return;
+  }
+  espresso::cudf_io::record_host_scalar_mirror(validity_ptr, data_ptr, lit);
+}
+
+template <typename Rep>
+inline void mirror_fixed_point_host_scalar(void const* validity_ptr,
+                                           void const* data_ptr,
+                                           data_type dtype,
+                                           Rep raw_value,
+                                           bool is_valid) noexcept
+{
+  if (!espresso_scalar_mirror_active()) { return; }
+  if constexpr (sizeof(Rep) > sizeof(std::int64_t)) {
+    if (raw_value < static_cast<Rep>(std::numeric_limits<std::int64_t>::min()) ||
+        raw_value > static_cast<Rep>(std::numeric_limits<std::int64_t>::max())) {
+      espresso::cudf_io::erase_host_scalar_mirror(validity_ptr);
+      return;
+    }
+  }
+  espresso::cudf_io::csd_host_literal_value lit{dtype, is_valid, static_cast<std::int64_t>(raw_value), 0, 0.0};
+  espresso::cudf_io::record_host_scalar_mirror(validity_ptr, data_ptr, lit);
+}
+}  // namespace
+#endif
 
 scalar::scalar(data_type type,
                bool is_valid,
@@ -25,23 +87,38 @@ scalar::scalar(data_type type,
                rmm::device_async_resource_ref mr)
   : _type(type), _is_valid(is_valid, stream, mr)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso_scalar_mirror_active()) { espresso::cudf_io::erase_host_scalar_mirror(_is_valid.data()); }
+#endif
 }
 
 scalar::scalar(scalar const& other, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
   : _type(other.type()), _is_valid(other._is_valid, stream, mr)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso_scalar_mirror_active()) { espresso::cudf_io::erase_host_scalar_mirror(_is_valid.data()); }
+#endif
 }
 
 data_type scalar::type() const noexcept { return _type; }
 
 void scalar::set_valid_async(bool is_valid, rmm::cuda_stream_view stream)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso_scalar_mirror_active()) { espresso::cudf_io::erase_host_scalar_mirror(_is_valid.data()); }
+#endif
   _is_valid.set_value_async(is_valid, stream);
 }
 
 bool scalar::is_valid(rmm::cuda_stream_view stream) const { return _is_valid.value(stream); }
 
-bool* scalar::validity_data() { return _is_valid.data(); }
+bool* scalar::validity_data()
+{
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso_scalar_mirror_active()) { espresso::cudf_io::erase_host_scalar_mirror(_is_valid.data()); }
+#endif
+  return _is_valid.data();
+}
 
 bool const* scalar::validity_data() const { return _is_valid.data(); }
 
@@ -117,6 +194,9 @@ fixed_point_scalar<T>::fixed_point_scalar(rep_type value,
   : scalar{data_type{type_to_id<T>(), static_cast<int32_t>(scale)}, is_valid, stream, mr},
     _data{value, stream, mr}
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  mirror_fixed_point_host_scalar(static_cast<scalar const*>(this)->validity_data(), _data.data(), this->type(), value, is_valid);
+#endif
 }
 
 template <typename T>
@@ -126,6 +206,9 @@ fixed_point_scalar<T>::fixed_point_scalar(rep_type value,
                                           rmm::device_async_resource_ref mr)
   : scalar{data_type{type_to_id<T>(), 0}, is_valid, stream, mr}, _data{value, stream, mr}
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  mirror_fixed_point_host_scalar(static_cast<scalar const*>(this)->validity_data(), _data.data(), this->type(), value, is_valid);
+#endif
 }
 
 template <typename T>
@@ -136,6 +219,9 @@ fixed_point_scalar<T>::fixed_point_scalar(T value,
   : scalar{data_type{type_to_id<T>(), value.scale()}, is_valid, stream, mr},
     _data{value.value(), stream, mr}
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  mirror_fixed_point_host_scalar(static_cast<scalar const*>(this)->validity_data(), _data.data(), this->type(), value.value(), is_valid);
+#endif
 }
 
 template <typename T>
@@ -173,6 +259,9 @@ T fixed_point_scalar<T>::fixed_point_value(rmm::cuda_stream_view stream) const
 template <typename T>
 typename fixed_point_scalar<T>::rep_type* fixed_point_scalar<T>::data()
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso_scalar_mirror_active()) { espresso::cudf_io::erase_host_scalar_mirror(static_cast<scalar const*>(this)->validity_data()); }
+#endif
   return _data.data();
 }
 
@@ -203,6 +292,9 @@ fixed_width_scalar<T>::fixed_width_scalar(T value,
                                           rmm::device_async_resource_ref mr)
   : scalar(data_type(type_to_id<T>()), is_valid, stream, mr), _data(value, stream, mr)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  mirror_fixed_width_host_scalar(static_cast<scalar const*>(this)->validity_data(), _data.data(), this->type(), value, is_valid);
+#endif
 }
 
 template <typename T>
@@ -227,6 +319,9 @@ void fixed_width_scalar<T>::set_value(T value, rmm::cuda_stream_view stream)
 {
   _data.set_value_async(value, stream);
   this->set_valid_async(true, stream);
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  mirror_fixed_width_host_scalar(static_cast<scalar const*>(this)->validity_data(), _data.data(), this->type(), value, true);
+#endif
 }
 
 template <typename T>
@@ -238,6 +333,9 @@ T fixed_width_scalar<T>::value(rmm::cuda_stream_view stream) const
 template <typename T>
 T* fixed_width_scalar<T>::data()
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (espresso_scalar_mirror_active()) { espresso::cudf_io::erase_host_scalar_mirror(static_cast<scalar const*>(this)->validity_data()); }
+#endif
   return _data.data();
 }
 
