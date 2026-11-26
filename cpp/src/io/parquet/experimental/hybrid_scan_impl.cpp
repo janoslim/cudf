@@ -6,9 +6,13 @@
 #include "hybrid_scan_impl.hpp"
 #ifdef CUDF_HAS_ESPRESSO_CSD
 #include "io/utilities/espresso_datasource_registry.hpp"
+#include <espresso/csd_gpu_footer.cuh>
+#include <espresso/csd_gpu_runtime.hpp>
 #include <espresso/cudf_io.hpp>
 #include <espresso/late_mat_bridge.hpp>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #endif
 
 #include "cudf/io/text/byte_range_info.hpp"
@@ -188,9 +192,23 @@ void hybrid_scan_reader_impl::init_espresso_hybrid_state()
     extracted.push_back(std::move(found));
   }
 
-  _espresso                     = std::make_unique<espresso_hybrid_state>();
-  _espresso->filepaths          = std::move(extracted);
-  _espresso->pre_parsed_footers = espresso_hybrid_state::convert_pre_parsed_footers(metadatas);
+  _espresso            = std::make_unique<espresso_hybrid_state>();
+  _espresso->filepaths = std::move(extracted);
+
+  // Reuse cached GPU-parsed footers directly (`O(1)`) when already warmed in `EspressoFooterCache`.
+  std::vector<espresso::csd::GpuHostParsedFooter> cached_gpu;
+  cached_gpu.reserve(_espresso->filepaths.size());
+  bool all_gpu_cached = true;
+  for (auto const& fp : _espresso->filepaths) {
+    auto hit = cudf::io::espresso_detail::EspressoFooterCache::instance().lookup_gpu_footer(fp);
+    if (!hit.has_value()) {
+      all_gpu_cached = false;
+      break;
+    }
+    cached_gpu.push_back(std::move(*hit));
+  }
+  _espresso->pre_parsed_footers =
+    all_gpu_cached ? std::move(cached_gpu) : espresso_hybrid_state::convert_pre_parsed_footers(metadatas);
 }
 
 bool hybrid_scan_reader_impl::can_espresso_offload_all_columns(
@@ -252,11 +270,10 @@ bool hybrid_scan_reader_impl::can_espresso_offload_all_columns(
       }
     }
   }
-   // Mirror Espresso per-card 64 MiB main / 16 MiB chars compact-tile staging guard BEFORE
-  // `all_column_chunks_byte_ranges()` returns 0 B, so unfiltered high-entropy wide-string row
-  // groups (e.g., synthetic random base62 comments in Zipf datasets) fall back cleanly to stock
-  // `libcudf` with populated `column_chunk_data` instead of overflowing the per-card staging arena.
-  if (!options.get_filter().has_value()) {
+  // Mirror Espresso per-card 64 MiB main / 16 MiB chars compact-tile staging guard BEFORE
+  // `all_column_chunks_byte_ranges()` returns 0 B (compact-tile mode only; raw mode `COMPACT=0`
+  // uses a separate `2 x (32 + 128) MiB` raw staging arena).
+  if (!options.get_filter().has_value() && espresso::cudf_io::is_csd_compact_mode_enabled()) {
     for (std::size_t src_i = 0; src_i < row_group_indices.size(); ++src_i) {
       for (size_type const rg_idx : row_group_indices[src_i]) {
         std::uint64_t min_incomp_main = 0;
@@ -334,18 +351,136 @@ parquet_reader_options hybrid_scan_reader_impl::build_espresso_pass_options(
 }
 #endif
 
+#ifdef CUDF_HAS_ESPRESSO_CSD
+namespace {
+/// True when raw Parquet Thrift footer bytes carry an embedded `"ARROW:schema"` key-value entry.
+[[nodiscard]] bool footer_has_arrow_schema_key(cudf::host_span<uint8_t const> fb) noexcept
+{
+  static constexpr char kKey[]      = "ARROW:schema";
+  static constexpr std::size_t kLen = sizeof(kKey) - 1u;
+  if (fb.size() < kLen) { return false; }
+  return ::memmem(fb.data(), fb.size(), kKey, kLen) != nullptr;
+}
+
+/// Build the projected leaf index mapping matching `options.get_column_names()` / `get_column_indices()` so
+/// `compile_ast_filter_intervals` resolves both `column_name_reference` (Sirius) and `column_reference` (Velox).
+[[nodiscard]] std::vector<std::size_t> build_espresso_projected_leaf_indices(
+  parquet_reader_options const& options,
+  std::vector<espresso::csd::GpuLeafSchema> const& leaves)
+{
+  auto const equals_name = [cs = options.is_enabled_case_sensitive_names()](std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) { return false; }
+    if (cs) { return a == b; }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) {
+        return false;
+      }
+    }
+    return true;
+  };
+  std::vector<std::size_t> out;
+  if (auto const& names = options.get_column_names(); names.has_value()) {
+    out.reserve(names->size());
+    for (auto const& name : *names) {
+      bool matched = false;
+      for (std::size_t i = 0; i < leaves.size(); ++i) {
+        if (equals_name(leaves[i].name, name)) {
+          out.push_back(i);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) { return {}; }
+    }
+  } else if (auto const& indices = options.get_column_indices(); indices.has_value()) {
+    out.reserve(indices->size());
+    for (auto const idx : *indices) {
+      if (idx < 0 || static_cast<std::size_t>(idx) >= leaves.size()) { return {}; }
+      out.push_back(static_cast<std::size_t>(idx));
+    }
+  }
+  return out;
+}
+}  // namespace
+#endif
+
 hybrid_scan_reader_impl::hybrid_scan_reader_impl(
   cudf::host_span<cudf::host_span<uint8_t const> const> footer_bytes,
   parquet_reader_options const& options)
 {
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  bool const espresso_active =
+    !footer_bytes.empty() &&
+    (espresso::cudf_io::is_csd_dropin_enabled() || espresso::late_mat::is_sql_rewrite_bridge_enabled());
+  if (espresso_active) {
+    auto& footer_cache = cudf::io::espresso_detail::EspressoFooterCache::instance();
+    std::vector<FileMetaData> cached_fmds;
+    std::vector<std::string> cached_paths;
+    std::vector<espresso::csd::GpuHostParsedFooter> cached_gpu;
+    cached_fmds.reserve(footer_bytes.size());
+    cached_paths.reserve(footer_bytes.size());
+    cached_gpu.reserve(footer_bytes.size());
+    bool all_cached      = true;
+    bool all_have_gpu    = true;
+    bool const use_arrow = options.is_enabled_use_arrow_schema();
+
+    for (auto const& fb : footer_bytes) {
+      // Fast path 1: O(1) lookup by `(footer_len, fnv1a_64)` skips CPU Thrift parsing completely.
+      auto hit = footer_cache.lookup_by_footer_hash(fb.data(), fb.size());
+      // Fast path 2: On first touch of a SmartSSD directory (no embedded ARROW:schema), GPU-warm the directory once.
+      if (!hit.has_value() && !(use_arrow && footer_has_arrow_schema_key(fb))) {
+        auto fp = cudf::io::espresso_detail::EspressoDatasetFooterIndex::instance().lookup_by_footer_bytes(
+          fb.data(), fb.size());
+        if (fp.has_value()) {
+          hit = footer_cache.lookup_bundle_by_path(*fp);
+          if (!hit.has_value() && espresso::csd::GpuRuntime::is_open()) {
+            std::string const real_fp = cudf::io::espresso_detail::resolve_canonical_local_path(*fp);
+            if (espresso::cudf_io::is_smartssd_parquet_path(real_fp)) {
+              footer_cache.warm_directory_on_gpu(*fp);
+              hit = footer_cache.lookup_bundle_by_path(*fp);
+            }
+          }
+          if (hit.has_value()) {
+            footer_cache.store_by_footer_hash(
+              fb.data(), fb.size(), hit->filepath, hit->file_metadata, hit->gpu_footer);
+          }
+        }
+      }
+      if (!hit.has_value()) {
+        all_cached = false;
+        break;
+      }
+      cached_paths.push_back(std::move(hit->filepath));
+      cached_fmds.push_back(std::move(hit->file_metadata));
+      if (hit->gpu_footer.has_value()) {
+        cached_gpu.push_back(std::move(*hit->gpu_footer));
+      } else {
+        all_have_gpu = false;
+      }
+    }
+
+    if (all_cached) {
+      _metadata = std::make_unique<aggregate_reader_metadata>(
+        cudf::host_span<FileMetaData const>{cached_fmds},
+        options.is_enabled_use_arrow_schema(),
+        has_cols_from_mismatched_sources(options));
+      _extended_metadata   = static_cast<aggregate_reader_metadata*>(_metadata.get());
+      _espresso            = std::make_unique<espresso_hybrid_state>();
+      _espresso->filepaths = std::move(cached_paths);
+      _espresso->pre_parsed_footers =
+        all_have_gpu ? std::move(cached_gpu) : espresso_hybrid_state::convert_pre_parsed_footers(cached_fmds);
+      return;
+    }
+  }
+#endif
+
   _metadata = std::make_unique<aggregate_reader_metadata>(
     footer_bytes, options.is_enabled_use_arrow_schema(), has_cols_from_mismatched_sources(options));
 
   _extended_metadata = static_cast<aggregate_reader_metadata*>(_metadata.get());
 #ifdef CUDF_HAS_ESPRESSO_CSD
   init_espresso_hybrid_state();
-  if (_espresso == nullptr && !footer_bytes.empty() &&
-      (espresso::cudf_io::is_csd_dropin_enabled() || espresso::late_mat::is_sql_rewrite_bridge_enabled())) {
+  if (_espresso == nullptr && espresso_active) {
     std::vector<std::string> resolved;
     resolved.reserve(footer_bytes.size());
     bool all_found = true;
@@ -359,9 +494,18 @@ hybrid_scan_reader_impl::hybrid_scan_reader_impl(
       resolved.push_back(std::move(*hit));
     }
     if (all_found) {
+      auto const parsed_fmds = _extended_metadata->parquet_metadatas();
+      auto converted_gpu     = espresso_hybrid_state::convert_pre_parsed_footers(parsed_fmds);
+      auto& footer_cache     = cudf::io::espresso_detail::EspressoFooterCache::instance();
+      for (std::size_t i = 0; i < footer_bytes.size() && i < parsed_fmds.size(); ++i) {
+        std::optional<espresso::csd::GpuHostParsedFooter> opt_gf;
+        if (converted_gpu.size() == parsed_fmds.size()) { opt_gf = converted_gpu[i]; }
+        footer_cache.store_by_footer_hash(
+          footer_bytes[i].data(), footer_bytes[i].size(), resolved[i], parsed_fmds[i], opt_gf);
+      }
       _espresso                     = std::make_unique<espresso_hybrid_state>();
       _espresso->filepaths          = std::move(resolved);
-      _espresso->pre_parsed_footers = espresso_hybrid_state::convert_pre_parsed_footers(_extended_metadata->parquet_metadatas());
+      _espresso->pre_parsed_footers = std::move(converted_gpu);
     }
   }
 #endif
@@ -557,6 +701,61 @@ std::vector<std::vector<size_type>> hybrid_scan_reader_impl::filter_row_groups_w
   rmm::cuda_stream_view stream)
 {
   CUDF_EXPECTS(not row_group_indices.empty(), "Empty input row group indices encountered");
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  if (_espresso != nullptr && !_espresso->filepaths.empty()) {
+    select_columns(read_columns_mode::ALL_COLUMNS, options);
+    if (can_espresso_offload_all_columns(row_group_indices, options)) {
+      auto pass_all_row_groups = [&]() {
+        return std::vector<std::vector<size_type>>{row_group_indices.begin(), row_group_indices.end()};
+      };
+      if (!options.get_filter().has_value()) { return pass_all_row_groups(); }
+      // Path-B late materialization must observe every Pass-1 file so survival-bitmap readiness waits for all files.
+      if (espresso::late_mat::is_sql_rewrite_bridge_enabled()) {
+        auto const probe_opts = build_espresso_pass_options(row_group_indices, options);
+        if (espresso::late_mat::LateMatBridgeRegistry::instance().should_intercept_scan(probe_opts)) {
+          return pass_all_row_groups();
+        }
+      }
+      // Host CPU statistics pruning (< 5 us, zero legacy stream 0 GPU AST kernels); unsupported ASTs pass all RGs.
+      if (_espresso->pre_parsed_footers.size() == row_group_indices.size() &&
+          !_espresso->pre_parsed_footers.empty()) {
+        auto const& first_gf    = _espresso->pre_parsed_footers.front();
+        auto const proj_indices = build_espresso_projected_leaf_indices(options, first_gf.leaves);
+        try {
+          auto const compiled = espresso::cudf_io::compile_ast_filter_intervals(
+            options.get_filter()->get(),
+            first_gf.leaves,
+            options.is_enabled_case_sensitive_names(),
+            stream,
+            {},
+            proj_indices);
+          if (compiled.prune_spec.count == 0u) { return pass_all_row_groups(); }
+
+          std::vector<std::vector<size_type>> pruned(row_group_indices.size());
+          for (std::size_t src_i = 0; src_i < row_group_indices.size(); ++src_i) {
+            std::uint32_t kept_mask = 0u;
+            bool const ok           = espresso::csd::prune_host_parsed_footer(
+              compiled.prune_spec, _espresso->pre_parsed_footers[src_i], kept_mask);
+            if (!ok) {
+              pruned[src_i] = row_group_indices[src_i];
+              continue;
+            }
+            pruned[src_i].reserve(row_group_indices[src_i].size());
+            for (size_type const rg_idx : row_group_indices[src_i]) {
+              if (rg_idx < 0 || rg_idx >= 32 || ((kept_mask & (1u << static_cast<unsigned>(rg_idx))) != 0u)) {
+                pruned[src_i].push_back(rg_idx);
+              }
+            }
+          }
+          return pruned;
+        } catch (...) {
+          return pass_all_row_groups();
+        }
+      }
+      return pass_all_row_groups();
+    }
+  }
+#endif
   auto [expr_conv, output_dtypes] = prepare_filter_and_output_types(options);
 
   return _extended_metadata->filter_row_groups_with_stats(row_group_indices,

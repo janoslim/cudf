@@ -28,6 +28,7 @@
 #include <cudf/io/parquet.hpp>
 #ifdef CUDF_HAS_ESPRESSO_CSD
 #include "io/utilities/espresso_datasource_registry.hpp"
+#include <espresso/csd_gpu_runtime.hpp>
 #include <espresso/cudf_io.hpp>
 #include <espresso/late_mat_bridge.hpp>
 #endif
@@ -732,13 +733,27 @@ std::vector<parquet::FileMetaData> read_parquet_footers(
     std::vector<std::unique_ptr<cudf::io::datasource>> miss_sources;
     std::vector<std::size_t> miss_indices;
     for (std::size_t i = 0; i < sources.size(); ++i) {
-      if (auto hit = espresso_detail::EspressoFooterCache::instance().lookup(*paths[i], sources[i]->size());
+      std::size_t const fsize = sources[i]->size();
+      if (auto hit = espresso_detail::EspressoFooterCache::instance().lookup(*paths[i], fsize);
           hit.has_value()) {
         out[i] = std::move(*hit);
-      } else {
-        miss_sources.push_back(cudf::io::datasource::create(sources[i].get()));
-        miss_indices.push_back(i);
+        continue;
       }
+      if (espresso::csd::GpuRuntime::is_open()) {
+        std::string const real_path = espresso_detail::resolve_canonical_local_path(*paths[i]);
+        if (espresso::cudf_io::is_smartssd_parquet_path(real_path)) {
+          // Batch-parse the whole table directory on GPU NVMe once (`0` host `open`/`pread`/Thrift parse).
+          espresso_detail::EspressoFooterCache::instance().warm_directory_on_gpu(*paths[i]);
+          if (auto warmed = espresso_detail::EspressoFooterCache::instance().lookup(*paths[i], fsize);
+              warmed.has_value()) {
+            out[i] = std::move(*warmed);
+            continue;
+          }
+          CUDF_FAIL("Espresso GPU footer cache missed SmartSSD file after warm_directory_on_gpu: " + *paths[i]);
+        }
+      }
+      miss_sources.push_back(cudf::io::datasource::create(sources[i].get()));
+      miss_indices.push_back(i);
     }
     if (!miss_sources.empty()) {
       auto parsed = detail_parquet::read_parquet_footers(miss_sources);

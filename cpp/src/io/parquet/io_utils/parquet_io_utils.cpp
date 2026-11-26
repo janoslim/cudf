@@ -9,6 +9,10 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/getenv_or.hpp>
+#ifdef CUDF_HAS_ESPRESSO_CSD
+#include <espresso/cudf_io.hpp>
+#include <espresso/late_mat_bridge.hpp>
+#endif
 #include <cudf/detail/utilities/host_worker_pool.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/io/datasource.hpp>
@@ -380,7 +384,15 @@ fetch_byte_ranges_to_device_async_impl(
 
 [[nodiscard]] std::size_t metadata_size_hint()
 {
-  static constexpr auto default_metadata_size_hint = std::size_t{64} * 1024;
+  std::size_t default_metadata_size_hint = std::size_t{64} * 1024;
+#ifdef CUDF_HAS_ESPRESSO_CSD
+  // Align speculative footer fetches with Espresso's 32 KiB GPU-NVMe warmed host tail cache
+  // (`espresso::csd::NVME_TAIL_SLOT_BYTES`) so KvikIO/datasource tail reads hit in ~1 us (`0` syscalls).
+  if (espresso::cudf_io::is_csd_dropin_enabled() ||
+      espresso::late_mat::is_sql_rewrite_bridge_enabled()) {
+    default_metadata_size_hint = std::size_t{32} * 1024;
+  }
+#endif
   return cudf::detail::getenv_or<std::size_t>("LIBCUDF_PARQUET_METADATA_SIZE_HINT",
                                               default_metadata_size_hint);
 }
